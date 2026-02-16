@@ -59,85 +59,160 @@
 
 
 
+        // ========== ANTI-SPOOFING CONFIG ==========
+        const EAR_CLOSED_THRESHOLD = 0.22;   // EAR below this = eyes closed
+        const EAR_OPEN_THRESHOLD = 0.26;     // EAR above this = eyes open (hysteresis)
+        const REQUIRED_CLOSED_FRAMES = 3;    // Consecutive closed frames needed
+        const MAX_FACE_SHIFT = 15;           // Max px face center can move per frame during blink
+        const MIN_FACE_WIDTH = 101;          // Reject far-away faces
+        const SAME_FACE_THRESHOLD = 0.4;     // Max descriptor distance for same face
 
-        // Consecutive frame counter for stable blink detection
-        let eyesClosedFrameCount = 0;
-
-        // Same-face tracking
+        // ========== ANTI-SPOOFING STATE ==========
+        let blinkState = 'WAITING_FOR_CLOSE'; // WAITING_FOR_CLOSE | EYES_CLOSED | BLINK_COMPLETE
+        let closedFrameCount = 0;
+        let lastFaceCenter = null;
         let lastFaceDescriptor = null;
-        const SAME_FACE_THRESHOLD = 0.4;  // Max distance to consider same face
+        let faceStableDuringBlink = true;
 
+        // ========== SAME FACE TRACKING ==========
         function isSameFace(currentDescriptor) {
             if (!lastFaceDescriptor) {
                 lastFaceDescriptor = currentDescriptor;
-                return true; // First detection, consider it valid
+                return true;
             }
-
-            // Calculate euclidean distance between descriptors
             const distance = euclideanDistance(currentDescriptor, lastFaceDescriptor);
-
             if (distance < SAME_FACE_THRESHOLD) {
-                lastFaceDescriptor = currentDescriptor; // Update for next frame
+                lastFaceDescriptor = currentDescriptor;
                 return true;
             } else {
-                // Different face detected - reset tracking
                 lastFaceDescriptor = currentDescriptor;
-                eyesClosedFrameCount = 0; // Reset eye counter
+                resetBlinkState();
                 return false;
             }
         }
 
-
-        // Consecutive frame counter for stable blink detection
-        const REQUIRED_CLOSED_FRAMES = 6; // Must be closed for 5 frames to trigger
-
-        function detectEyesClosed(landmarks, descriptor) {
-
-            // Check if same face as previous frame
-            if (!isSameFace(descriptor)) {
-                return false; // Face switched, reset and skip
-            }
-            const leftEye = landmarks.getLeftEye();
-            const rightEye = landmarks.getRightEye();
-            const leftDist = Math.abs(leftEye[1].y - leftEye[5].y);
-            const rightDist = Math.abs(rightEye[1].y - rightEye[5].y);
-
-            // Debug: show live eye distances
-            matchedLog.innerText = 'L:' + leftDist.toFixed(1) + ' R:' + rightDist.toFixed(1) + ' frames:' + eyesClosedFrameCount + ' face:' + (window._lastFaceWidth || '?') + 'px';
-
-            const eyesLookClosed = (leftDist < 4 || rightDist < 4);
-
-            if (eyesLookClosed) {
-                eyesClosedFrameCount++;
-            } else {
-                eyesClosedFrameCount = 0; // Reset counter when eyes not clearly closed
-            }
-
-            // Only return true if closed for required consecutive frames
-            return eyesClosedFrameCount >= REQUIRED_CLOSED_FRAMES;
+        function resetBlinkState() {
+            blinkState = 'WAITING_FOR_CLOSE';
+            closedFrameCount = 0;
+            faceStableDuringBlink = true;
         }
 
-        const MIN_FACE_WIDTH = 101; // Minimum face box width in pixels — reject far-away faces
+        // ========== EAR (Eye Aspect Ratio) ==========
+        // Uses all 6 eye landmark points for scale-invariant measurement
+        // EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+        function pointDist(a, b) {
+            return Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2));
+        }
 
+        function computeEAR(eyePoints) {
+            // eyePoints: 6 points [p1..p6] from face-api landmark
+            const vertical1 = pointDist(eyePoints[1], eyePoints[5]);
+            const vertical2 = pointDist(eyePoints[2], eyePoints[4]);
+            const horizontal = pointDist(eyePoints[0], eyePoints[3]);
+            if (horizontal === 0) return 1; // Avoid division by zero
+            return (vertical1 + vertical2) / (2 * horizontal);
+        }
+
+        // ========== FACE STABILITY CHECK ==========
+        function checkFaceStability(faceBox) {
+            const cx = faceBox.x + faceBox.width / 2;
+            const cy = faceBox.y + faceBox.height / 2;
+
+            if (lastFaceCenter) {
+                const dx = Math.abs(cx - lastFaceCenter.x);
+                const dy = Math.abs(cy - lastFaceCenter.y);
+                if (dx > MAX_FACE_SHIFT || dy > MAX_FACE_SHIFT) {
+                    faceStableDuringBlink = false;
+                }
+            }
+            lastFaceCenter = { x: cx, y: cy };
+        }
+
+        // ========== BLINK CYCLE STATE MACHINE ==========
+        // Requires full cycle: OPEN → CLOSED (N frames) → OPEN
+        function detectBlink(landmarks, descriptor, faceBox) {
+            // Same face check
+            if (!isSameFace(descriptor)) {
+                return false;
+            }
+
+            // Compute EAR for both eyes
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            const leftEAR = computeEAR(leftEye);
+            const rightEAR = computeEAR(rightEye);
+            const avgEAR = (leftEAR + rightEAR) / 2;
+
+            // Track face position stability
+            checkFaceStability(faceBox);
+
+            // Debug display
+            matchedLog.innerText = 'EAR:' + avgEAR.toFixed(3)
+                + ' state:' + blinkState
+                + ' closed:' + closedFrameCount
+                + ' stable:' + (faceStableDuringBlink ? '✓' : '✗')
+                + ' face:' + faceBox.width.toFixed(0) + 'px';
+
+            // State machine
+            switch (blinkState) {
+                case 'WAITING_FOR_CLOSE':
+                    if (avgEAR < EAR_CLOSED_THRESHOLD) {
+                        closedFrameCount++;
+                        if (closedFrameCount >= REQUIRED_CLOSED_FRAMES) {
+                            blinkState = 'EYES_CLOSED';
+                            faceStableDuringBlink = true; // Start tracking stability from here
+                        }
+                    } else {
+                        closedFrameCount = 0;
+                        faceStableDuringBlink = true;
+                    }
+                    return false;
+
+                case 'EYES_CLOSED':
+                    if (avgEAR > EAR_OPEN_THRESHOLD) {
+                        // Eyes reopened — check if face was stable during blink
+                        if (faceStableDuringBlink) {
+                            blinkState = 'BLINK_COMPLETE';
+                            return true; // Real blink detected!
+                        } else {
+                            // Face moved too much — likely a photo being shifted
+                            log.innerText = '⚠️ Spoof rejected (face moved)';
+                            resetBlinkState();
+                            return false;
+                        }
+                    }
+                    // Still closed — keep tracking stability
+                    return false;
+
+                case 'BLINK_COMPLETE':
+                    // Already triggered, reset for next blink
+                    resetBlinkState();
+                    return false;
+            }
+            return false;
+        }
+
+        // ========== DETECT LOOP ==========
         async function detectLoop() {
             const detections = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
             if (!detections) {
                 log.innerText = "No Face detected";
+                resetBlinkState();
+                lastFaceCenter = null;
             } else {
                 const faceBox = detections.detection.box;
 
-                // FACE SIZE CHECK: if face is too small (far away), skip blink logic
                 if (faceBox.width < MIN_FACE_WIDTH) {
                     log.innerText = "⚠️ Too far! Face:" + faceBox.width.toFixed(0) + "px";
                     matchedLog.innerText = "Move closer (need " + MIN_FACE_WIDTH + "px, got " + faceBox.width.toFixed(0) + "px)";
+                    resetBlinkState();
                 } else {
-                    window._lastFaceWidth = faceBox.width.toFixed(0);
                     log.innerText = "Face detected (size:" + faceBox.width.toFixed(0) + "px)";
-                    const closed = detectEyesClosed(detections.landmarks, Array.from(detections.descriptor));
+                    const blinked = detectBlink(detections.landmarks, Array.from(detections.descriptor), faceBox);
 
-                    if (closed) {
-                        log.innerText = '😑 Eyes Closed!';
-                        eyeCloseLog.innerText = '😑 Eyes Closed!';
+                    if (blinked) {
+                        log.innerText = '😑 Blink Detected!';
+                        eyeCloseLog.innerText = '😑 Blink Detected!';
                     }
                 }
             }
