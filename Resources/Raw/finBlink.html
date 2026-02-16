@@ -287,7 +287,7 @@
                         console.log('Face too far: box width=' + faceBox.width + 'px (min=' + MIN_FACE_WIDTH + ')');
                     } else {
                         const now = Date.now();
-                        const closed = detectEyesClosed(detection.landmarks, Array.from(detection.descriptor));
+                        const closed = detectEyesClosed(detection.landmarks, Array.from(detection.descriptor), faceBox);
 
                         if (closed) {
                             document.getElementById('blinkCount').innerText = '😑 Eyes Closed!';
@@ -309,11 +309,15 @@
 
         // Consecutive frame counter for stable blink detection
         let eyesClosedFrameCount = 0;
-        const REQUIRED_CLOSED_FRAMES = 5; // Must be closed for 3 frames to trigger
+        const REQUIRED_CLOSED_FRAMES = 5; // Must be closed for 5 frames to trigger
 
         // Same-face tracking
         let lastFaceDescriptor = null;
         const SAME_FACE_THRESHOLD = 0.4;  // Max distance to consider same face
+
+        // Face-movement guard — skip blink when phone is moving
+        let lastFaceCenter = null;
+        const MAX_FACE_MOVE = 15; // Max pixels the face center can jump between frames
 
         function isSameFace(currentDescriptor) {
             if (!lastFaceDescriptor) {
@@ -335,18 +339,48 @@
             }
         }
 
-        function detectEyesClosed(landmarks, descriptor) {
+        // Eye Aspect Ratio — resolution-independent
+        function eyeAspectRatio(eye) {
+            // eye points: 0=left corner, 1=upper-left, 2=upper-right, 3=right corner, 4=lower-right, 5=lower-left
+            const verticalA = Math.hypot(eye[1].x - eye[5].x, eye[1].y - eye[5].y);
+            const verticalB = Math.hypot(eye[2].x - eye[4].x, eye[2].y - eye[4].y);
+            const horizontal = Math.hypot(eye[0].x - eye[3].x, eye[0].y - eye[3].y);
+            if (horizontal === 0) return 1; // safety
+            return (verticalA + verticalB) / (2.0 * horizontal);
+        }
+
+        const EAR_THRESHOLD = 0.19; // Below this = eyes closed (works across resolutions)
+
+        function detectEyesClosed(landmarks, descriptor, faceBox) {
             // Check if same face as previous frame
             if (!isSameFace(descriptor)) {
                 return false; // Face switched, reset and skip
             }
 
+            // Face-movement guard: if face center moved too much, skip (phone is moving)
+            const centerX = faceBox.x + faceBox.width / 2;
+            const centerY = faceBox.y + faceBox.height / 2;
+            if (lastFaceCenter) {
+                const dx = centerX - lastFaceCenter.x;
+                const dy = centerY - lastFaceCenter.y;
+                const moved = Math.sqrt(dx * dx + dy * dy);
+                if (moved > MAX_FACE_MOVE) {
+                    lastFaceCenter = { x: centerX, y: centerY };
+                    eyesClosedFrameCount = 0; // Reset — movement detected
+                    return false;
+                }
+            }
+            lastFaceCenter = { x: centerX, y: centerY };
+
             const leftEye = landmarks.getLeftEye();
             const rightEye = landmarks.getRightEye();
-            const leftDist = Math.abs(leftEye[1].y - leftEye[5].y);
-            const rightDist = Math.abs(rightEye[1].y - rightEye[5].y);
 
-            const eyesLookClosed = (leftDist < 7 && rightDist < 7);
+            // Use Eye Aspect Ratio (resolution-independent) instead of absolute pixels
+            const leftEAR = eyeAspectRatio(leftEye);
+            const rightEAR = eyeAspectRatio(rightEye);
+            const avgEAR = (leftEAR + rightEAR) / 2.0;
+
+            const eyesLookClosed = (avgEAR < EAR_THRESHOLD);
 
             if (eyesLookClosed) {
                 eyesClosedFrameCount++;
