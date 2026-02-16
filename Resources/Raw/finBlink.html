@@ -346,7 +346,7 @@
             const leftDist = Math.abs(leftEye[1].y - leftEye[5].y);
             const rightDist = Math.abs(rightEye[1].y - rightEye[5].y);
 
-            const eyesLookClosed = (leftDist < 5 && rightDist < 5);
+            const eyesLookClosed = (leftDist < 7 && rightDist < 7);
 
             if (eyesLookClosed) {
                 eyesClosedFrameCount++;
