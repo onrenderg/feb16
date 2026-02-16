@@ -1,0 +1,146 @@
+<html>
+
+<head>
+    <script src="static/js/face-api.min.js"></script>
+</head>
+
+<body>
+    <video id="video" width="720" height="560" autoplay muted></video>
+    <div id="log">Log</div>
+    <div id="matchedLog">?</div>
+    <script>
+
+
+        var log = document.getElementById("log");
+        var matchedLog = document.getElementById("matchedLog");
+        const video = document.getElementById("video");
+
+        const MODLES = 'static/models';
+        async function loadModels() {
+            log.innerText = "Loading models...";
+            await faceapi.nets.ssdMobilenetv1.loadFromUri(MODLES);
+            await faceapi.nets.faceRecognitionNet.loadFromUri(MODLES);
+            await faceapi.nets.faceLandmark68Net.loadFromUri(MODLES);
+            log.innerText = "Models loaded";
+        }
+
+
+
+
+        var videoStream = null; // Store camera stream for release
+
+        async function startCamera() {
+
+            log.innerText = 'Requesting camera...';
+
+            videoStream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'environment', width: 320, height: 240 }
+            });
+            video.srcObject = videoStream;
+
+            log.innerText = '✅ Ready! Close eyes to mark';
+
+        }
+
+
+
+
+
+
+
+
+        function euclideanDistance(a, b) {
+            return Math.sqrt(a.reduce((sum, v, i) => sum + Math.pow(v - b[i], 2), 0));
+        }
+
+
+        // Same-face tracking
+        let lastFaceDescriptor = null;
+        const SAME_FACE_THRESHOLD = 0.4;  // Max distance to consider same face  lower value strict higher lienent match 
+
+        /*
+        scoreThreshold:      ↑ RAISE   (e.g. 0.5 → 0.6)   → reject far detections
+        SAME_FACE_THRESHOLD: ↓ LOWER   (e.g. 0.4 → 0.3)   → reset counter on distance shift
+        MATCH_THRESHOLD:     ↓ LOWER   (e.g. 0.5 → 0.4)   → stricter identity matching
+
+*/
+
+
+        function isSameFace(currentDescriptor) {
+            if (!lastFaceDescriptor) {
+                lastFaceDescriptor = currentDescriptor;
+                return true; // First detection, consider it valid
+            }
+
+            // Calculate euclidean distance between descriptors
+            const distance = euclideanDistance(currentDescriptor, lastFaceDescriptor);
+
+            if (distance < SAME_FACE_THRESHOLD) {
+                lastFaceDescriptor = currentDescriptor; // Update for next frame
+                return true;
+            } else {
+                // Different face detected - reset tracking
+                lastFaceDescriptor = currentDescriptor;
+                eyesClosedFrameCount = 0; // Reset eye counter
+                return false;
+            }
+        }
+
+
+
+        // Consecutive frame counter for stable blink detection
+        const REQUIRED_CLOSED_FRAMES = 5; // Must be closed for 3 frames to trigger
+        let eyesClosedFrameCount = 0;
+
+        function detectEyesClosed(landmarks, descriptor) {
+            // Check if same face as previous frame
+            if (!isSameFace(descriptor)) {
+                return false; // Face switched, reset and skip
+            }
+
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            const leftDist = Math.abs(leftEye[1].y - leftEye[5].y);
+            const rightDist = Math.abs(rightEye[1].y - rightEye[5].y);
+
+            const eyesLookClosed = (leftDist < 5 && rightDist < 5);
+
+            if (eyesLookClosed) {
+                eyesClosedFrameCount++;
+            } else {
+                eyesClosedFrameCount = 0; // Reset counter when eyes not clearly closed
+            }
+
+            // Only return true if closed for required consecutive frames
+            return eyesClosedFrameCount >= REQUIRED_CLOSED_FRAMES;
+        }
+
+        async function detectLoop() {
+            const detections = await faceapi.detectSingleFace(video).withFaceLandmarks().withFaceDescriptor();
+            if (!detections) {
+                log.innerText = "No Face detected";
+            } else {
+                log.innerText = "Face detected";
+                const closed = detectEyesClosed(detections.landmarks, Array.from(detections.descriptor));
+
+                if (closed) {
+                    log.innerText = '😑 Eyes Closed!';
+                }
+            }
+            requestAnimationFrame(detectLoop);
+
+        }
+
+
+        async function main() {
+            await loadModels();
+            await startCamera();
+            video.onloadeddata = function () {
+                detectLoop()
+            }
+        }
+        main();
+    </script>
+</body>
+
+</html>
