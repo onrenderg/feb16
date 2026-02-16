@@ -5,12 +5,9 @@
 </head>
 
 <body>
-
-    <!-- style to centr video -->
-    <video id="video" width="720" height="560" autoplay muted style="display: block; margin: 0 auto;"></video>
+    <video id="video" width="720" height="560" autoplay muted></video>
     <div id="log">Log</div>
     <div id="matchedLog">?</div>
-    <div id="eyeCloseLog">?</div>
     <script>
 
 
@@ -57,15 +54,17 @@
         }
 
 
-
-
-
-        // Consecutive frame counter for stable blink detection
-        let eyesClosedFrameCount = 0;
-
         // Same-face tracking
         let lastFaceDescriptor = null;
-        const SAME_FACE_THRESHOLD = 0.4;  // Max distance to consider same face
+        const SAME_FACE_THRESHOLD = 0.4;  // Max distance to consider same face  lower value strict higher lienent match 
+
+        /*
+        scoreThreshold:      ↑ RAISE   (e.g. 0.5 → 0.6)   → reject far detections
+        SAME_FACE_THRESHOLD: ↓ LOWER   (e.g. 0.4 → 0.3)   → reset counter on distance shift
+        MATCH_THRESHOLD:     ↓ LOWER   (e.g. 0.5 → 0.4)   → stricter identity matching
+
+*/
+
 
         function isSameFace(currentDescriptor) {
             if (!lastFaceDescriptor) {
@@ -88,15 +87,17 @@
         }
 
 
+
         // Consecutive frame counter for stable blink detection
-        const REQUIRED_CLOSED_FRAMES = 6; // Must be closed for 5 frames to trigger
+        const REQUIRED_CLOSED_FRAMES = 5; // Must be closed for 5 frames to trigger
+        let eyesClosedFrameCount = 0;
 
         function detectEyesClosed(landmarks, descriptor) {
-
             // Check if same face as previous frame
             if (!isSameFace(descriptor)) {
                 return false; // Face switched, reset and skip
             }
+
             const leftEye = landmarks.getLeftEye();
             const rightEye = landmarks.getRightEye();
             const leftDist = Math.abs(leftEye[1].y - leftEye[5].y);
@@ -117,7 +118,7 @@
             return eyesClosedFrameCount >= REQUIRED_CLOSED_FRAMES;
         }
 
-        const MIN_FACE_WIDTH = 101; // Minimum face box width in pixels — reject far-away faces
+        const MIN_FACE_WIDTH = 100; // Minimum face box width in pixels — reject far-away faces
 
         async function detectLoop() {
             const detections = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
@@ -137,7 +138,6 @@
 
                     if (closed) {
                         log.innerText = '😑 Eyes Closed!';
-                        eyeCloseLog.innerText = '😑 Eyes Closed!';
                     }
                 }
             }
