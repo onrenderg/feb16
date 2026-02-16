@@ -1,0 +1,614 @@
+!DOCTYPE html>
+<html>
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Face Attendance</title>
+    <script>
+        // Fetch polyfill for file:// URLs - required for face-api.js model loading in Android WebView
+        (function () {
+            const originalFetch = window.fetch;
+            window.fetch = function (input, init) {
+                let url = typeof input === 'string' ? input : (input && input.url ? input.url : null);
+                if (!url) return originalFetch.call(window, input, init);
+
+                // Convert relative URLs to file:// URLs
+                if (!url.startsWith('http') && !url.startsWith('file://')) {
+                    const base = window.location.href.substring(0, window.location.href.lastIndexOf('/') + 1);
+                    if (url.startsWith('./')) {
+                        url = base + url.substring(2);
+                    } else if (url.startsWith('/')) {
+                        url = 'file://' + url;
+                    } else {
+                        url = base + url;
+                    }
+                }
+
+                // Handle file:// URLs with XHR
+                if (url.startsWith('file://')) {
+                    return new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('GET', url, true);
+                        xhr.responseType = 'arraybuffer';
+
+                        xhr.onload = function () {
+                            if (xhr.status === 0 || xhr.status === 200) {
+                                const arrayBuffer = xhr.response;
+                                const headers = new Headers();
+                                headers.set('content-type', url.endsWith('.json') ? 'application/json' : 'application/octet-stream');
+
+                                resolve({
+                                    ok: true,
+                                    status: 200,
+                                    headers: headers,
+                                    url: url,
+                                    json: function () {
+                                        const text = new TextDecoder().decode(arrayBuffer);
+                                        return Promise.resolve(JSON.parse(text));
+                                    },
+                                    text: function () {
+                                        return Promise.resolve(new TextDecoder().decode(arrayBuffer));
+                                    },
+                                    arrayBuffer: function () {
+                                        return Promise.resolve(arrayBuffer);
+                                    },
+                                    blob: function () {
+                                        return Promise.resolve(new Blob([arrayBuffer]));
+                                    }
+                                });
+                            } else {
+                                reject(new Error('XHR failed: ' + xhr.status + ' for ' + url));
+                            }
+                        };
+                        xhr.onerror = function () {
+                            reject(new Error('XHR error for ' + url));
+                        };
+                        xhr.send();
+                    });
+                }
+                return originalFetch.call(window, input, init);
+            };
+        })();
+    </script>
+    <script src="static/js/face-api.min.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: Arial;
+            text-align: center;
+            background: #1a1a2e;
+            color: white;
+            min-height: 100vh;
+            padding: 10px;
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 10px 0;
+        }
+
+        video {
+            width: 100%;
+            max-width: 420px;
+            height: 100%;
+            max-height: 500px;
+            object-fit: cover;
+            border: 3px solid #00d4ff;
+            border-radius: 10px;
+        }
+
+        button {
+            padding: 12px 20px;
+            margin: 8px 5px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            font-size: 14px;
+            color: white;
+            display: none !important;
+            /* Hide manual buttons */
+        }
+
+        .register {
+            background: #4CAF50;
+        }
+
+        .clear {
+            background: #f44336;
+        }
+
+        input {
+            padding: 10px;
+            font-size: 14px;
+            border-radius: 5px;
+            border: none;
+            margin: 8px;
+            width: 60%;
+            display: none !important;
+            /* Hide manual input */
+        }
+
+        #result {
+            margin: 10px;
+            padding: 15px;
+            font-size: 16px;
+            border-radius: 10px;
+        }
+
+        .success {
+            background: #4CAF50;
+        }
+
+        .error {
+            background: #f44336;
+        }
+
+        .info {
+            background: #333;
+        }
+
+        #status {
+            color: #00d4ff;
+            margin: 8px;
+            font-size: 14px;
+        }
+
+        #blinkCount {
+            font-size: 22px;
+            color: #ff9800;
+            margin: 10px;
+        }
+
+        #dbCount {
+            color: #888;
+            font-size: 12px;
+            margin: 5px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1 style="display: none !important;">🎯 Face Attendance</h1>
+    <div id="status">Loading models...</div>
+    <div id="blinkCount">👀 Eyes Open</div>
+    <video id="video" autoplay playsinline muted></video>
+    <br>
+    <input type="text" id="name" placeholder="Enter name">
+    <br>
+    <button class="register" onclick="register()">✅ Register</button>
+    <button class="clear" onclick="clearDb()">🗑️ Clear All</button>
+    <div id="result" class="info">Close eyes to mark attendance</div>
+    <div id="dbCount" style="display: none !important;">Registered: 0</div>
+
+    <script>
+        const STORAGE_KEY = 'FACES_DB';
+        let facesDb = {};
+        let lastAttendanceTime = 0;
+        const COOLDOWN = 5000;
+        const MODEL_URL = 'static/models';
+        const MATCH_THRESHOLD = 0.5;
+        let videoStream = null; // Store camera stream for release
+        let detectOnlyMode = false; // Flag for detect-only mode (no vector matching)
+
+        // Stop camera and release resources
+        window.stopCamera = function () {
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+                videoStream = null;
+            }
+            const video = document.getElementById('video');
+            if (video) {
+                video.srcObject = null;
+            }
+            return 'Camera stopped';
+        };
+
+        // Send callback to C# (MAUI)
+        function sendToMaui(type, data) {
+            const params = new URLSearchParams(data).toString();
+            window.location.href = 'callback://' + type + '?' + params;
+        }
+
+        function loadDb() {
+            try {
+                const data = localStorage.getItem(STORAGE_KEY);
+                facesDb = data ? JSON.parse(data) : {};
+                updateDbCount();
+            } catch (e) { facesDb = {}; }
+        }
+
+        function saveDb() {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(facesDb));
+            updateDbCount();
+        }
+
+        function clearDb() {
+            if (confirm('Clear all registered faces?')) {
+                facesDb = {};
+                localStorage.removeItem(STORAGE_KEY);
+                updateDbCount();
+                showResult('🗑️ All faces cleared', 'info');
+                sendToMaui('cleared', { count: 0 });
+            }
+        }
+
+        function updateDbCount() {
+            document.getElementById('dbCount').innerText = 'Registered: ' + Object.keys(facesDb).length;
+        }
+
+        async function init() {
+            loadDb();
+            document.getElementById('status').innerText = 'Loading models...';
+
+            try {
+                await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+                // await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+
+                document.getElementById('status').innerText = 'Requesting camera...';
+
+                const video = document.getElementById('video');
+                videoStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment', width: 320, height: 240 }
+                });
+                video.srcObject = videoStream;
+
+                document.getElementById('status').innerText = '✅ Ready! Close eyes to mark';
+                sendToMaui('ready', { status: 'initialized' });
+                video.onloadeddata = () => detectLoop();
+            } catch (err) {
+                document.getElementById('status').innerText = '❌ ' + err.message;
+                sendToMaui('error', { message: err.message });
+                console.error(err);
+            }
+        }
+
+        const MIN_FACE_WIDTH = 100; // Minimum face box width in pixels — reject far-away faces
+
+        async function detectLoop() {
+            const video = document.getElementById('video');
+
+            try {
+                const detection = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+                    .withFaceLandmarks()
+                    .withFaceDescriptor();
+
+                if (detection) {
+                    const faceBox = detection.detection.box;
+
+                    if (faceBox.width < MIN_FACE_WIDTH) {
+                        document.getElementById('blinkCount').innerText = '📏 Come closer';
+                        console.log('Face too far: box width=' + faceBox.width + 'px (min=' + MIN_FACE_WIDTH + ')');
+                    } else {
+                        const now = Date.now();
+                        const closed = detectEyesClosed(detection.landmarks, Array.from(detection.descriptor));
+
+                        if (closed) {
+                            document.getElementById('blinkCount').innerText = '😑 Eyes Closed!';
+                            if ((now - lastAttendanceTime) > COOLDOWN) {
+                                lastAttendanceTime = now;
+                                markAttendance(Array.from(detection.descriptor));
+                            }
+                        } else {
+                            document.getElementById('blinkCount').innerText = '👀 Eyes Open';
+                        }
+                    }
+                } else {
+                    document.getElementById('blinkCount').innerText = '❓ No face';
+                }
+            } catch (e) { }
+
+            requestAnimationFrame(detectLoop);
+        }
+
+        // Consecutive frame counter for stable blink detection
+        let eyesClosedFrameCount = 0;
+        const REQUIRED_CLOSED_FRAMES = 5; // Must be closed for 3 frames to trigger
+
+        // Same-face tracking
+        let lastFaceDescriptor = null;
+        const SAME_FACE_THRESHOLD = 0.4;  // Max distance to consider same face
+
+        function isSameFace(currentDescriptor) {
+            if (!lastFaceDescriptor) {
+                lastFaceDescriptor = currentDescriptor;
+                return true; // First detection, consider it valid
+            }
+
+            // Calculate euclidean distance between descriptors
+            const distance = euclideanDistance(currentDescriptor, lastFaceDescriptor);
+
+            if (distance < SAME_FACE_THRESHOLD) {
+                lastFaceDescriptor = currentDescriptor; // Update for next frame
+                return true;
+            } else {
+                // Different face detected - reset tracking
+                lastFaceDescriptor = currentDescriptor;
+                eyesClosedFrameCount = 0; // Reset eye counter
+                return false;
+            }
+        }
+
+        function detectEyesClosed(landmarks, descriptor) {
+            // Check if same face as previous frame
+            if (!isSameFace(descriptor)) {
+                return false; // Face switched, reset and skip
+            }
+
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            const leftDist = Math.abs(leftEye[1].y - leftEye[5].y);
+            const rightDist = Math.abs(rightEye[1].y - rightEye[5].y);
+
+            const eyesLookClosed = (leftDist < 7 && rightDist < 7);
+
+            if (eyesLookClosed) {
+                eyesClosedFrameCount++;
+            } else {
+                eyesClosedFrameCount = 0; // Reset counter when eyes not clearly closed
+            }
+
+            // Only return true if closed for required consecutive frames
+            return eyesClosedFrameCount >= REQUIRED_CLOSED_FRAMES;
+        }
+
+
+
+        // Store last captured image for C# to retrieve
+        let lastMatchImage = null;
+
+        function captureFrame() {
+            const video = document.getElementById('video');
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth || 320;
+            canvas.height = video.videoHeight || 240;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            return canvas.toDataURL('image/jpeg', 0.8); // Return base64 JPEG
+        }
+
+        function markAttendance(descriptor) {
+            // Capture the frame first
+            lastMatchImage = captureFrame();
+
+            // DETECT-ONLY MODE: Skip matching, just send captured image
+            if (detectOnlyMode) {
+                showResult('📸 Face Captured!', 'success');
+                sendToMaui('detectonly', {
+                    name: 'DetectedFace',
+                    confidence: '100',
+                    isMatch: 'true',
+                    hasImage: 'true'
+                });
+                return;
+            }
+
+            // Block matching until reference is registered
+            if (Object.keys(facesDb).length === 0) {
+                showResult('⏳ Wait for reference to load...', 'info');
+                return;
+            }
+            const match = findMatch(descriptor);
+            if (match.name) {
+                const confidence = ((1 - match.distance) * 100).toFixed(0);
+                showResult('✅ ' + match.name + ' (' + confidence + '%)', 'success');
+
+                // Send match result to C# (image retrieved separately via getLastMatchImage)
+                sendToMaui('match', {
+                    name: match.name,
+                    confidence: confidence,
+                    isMatch: 'true',
+                    hasImage: 'true'
+                });
+            } else {
+                showResult('❌ Not recognized', 'error');
+                sendToMaui('notmatch', {
+                    name: match.name,
+                    confidence: '0',
+                    isMatch: 'false',
+                    hasImage: 'true'
+                });
+            }
+        }
+
+        // Expose function for C# to retrieve the captured image
+        window.getLastMatchImage = function () {
+            return lastMatchImage || '';
+        };
+
+        function euclideanDistance(a, b) {
+            return Math.sqrt(a.reduce((sum, v, i) => sum + Math.pow(v - b[i], 2), 0));
+        }
+
+        function findMatch(descriptor, threshold = MATCH_THRESHOLD) {
+            let best = { name: null, distance: Infinity };
+            for (const [name, stored] of Object.entries(facesDb)) {
+                const dist = euclideanDistance(descriptor, stored);
+                if (dist < best.distance) best = { name, distance: dist };
+            }
+            return best.distance < threshold ? best : { name: null, distance: best.distance };
+        }
+
+        async function register() {
+            const name = document.getElementById('name').value.trim();
+            if (!name) { showResult('❌ Enter name', 'error'); return; }
+
+            const video = document.getElementById('video');
+            const det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+                .withFaceLandmarks().withFaceDescriptor();
+
+            if (!det) {
+                showResult('❌ No face detected', 'error');
+                sendToMaui('register', { success: 'false', name: name, error: 'No face detected' });
+                return;
+            }
+
+            const descriptor = Array.from(det.descriptor);
+            const match = findMatch(descriptor, 0.4);
+            if (match.name) {
+                showResult('❌ Similar to: ' + match.name, 'error');
+                sendToMaui('register', { success: 'false', name: name, error: 'Similar to ' + match.name });
+                return;
+            }
+
+            facesDb[name] = descriptor;
+            saveDb();
+            document.getElementById('name').value = '';
+            showResult('✅ Registered: ' + name, 'success');
+            sendToMaui('register', { success: 'true', name: name, total: Object.keys(facesDb).length });
+        }
+
+        function showResult(msg, type) {
+            const el = document.getElementById('result');
+            el.innerText = msg;
+            el.className = type || 'info';
+        }
+
+        // Expose functions to C# via EvaluateJavaScriptAsync
+        window.setThreshold = function (value) {
+            window.MATCH_THRESHOLD = value;
+            return 'Threshold set to ' + value;
+        };
+
+        window.getRegisteredCount = function () {
+            return Object.keys(facesDb).length;
+        };
+
+        window.getRegisteredNames = function () {
+            return JSON.stringify(Object.keys(facesDb));
+        };
+
+        window.registerExternalImage = async function (data, name) {
+            try {
+                // Check if data is already a vector (Array)
+                if (Array.isArray(data)) {
+                    document.getElementById('status').innerText = '⏳ Loading reference vector...';
+                    facesDb = {};
+                    facesDb[name] = data;
+                    updateDbCount();
+                    showResult('✅ Reference Vector Loaded', 'success');
+                    document.getElementById('status').innerText = '✅ Ready! (Vector Mode)';
+                    return 'Registered vector ' + name;
+                }
+
+                /*
+                // Otherwise treat as base64 image string
+                let base64Data = data;
+                document.getElementById('status').innerText = '⏳ Processing reference image...';
+
+                const img = new Image();
+                // Ensure prefix
+                if (!base64Data.startsWith('data:image')) {
+                    base64Data = 'data:image/jpeg;base64,' + base64Data;
+                }
+                img.src = base64Data;
+
+                await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                });
+
+                const det = await faceapi.detectSingleFace(img, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.3 }))
+                    .withFaceLandmarks().withFaceDescriptor();
+
+                if (!det) {
+                    showResult('❌ Reference rejected: No face found', 'error');
+                    sendToMaui('error', { message: 'Reference image has no face' });
+                    return 'No face found';
+                }
+
+                // Clear DB for 1:1 match mode
+                facesDb = {};
+                facesDb[name] = Array.from(det.descriptor);
+                // saveDb(); // Optional: don't save if only for this session
+                updateDbCount();
+
+                showResult('✅ Reference Loaded ', 'success');
+                document.getElementById('status').innerText = '✅ Ready!  ' ;
+                return 'Registered ' + name;
+                */
+                return 'Base64 registration disabled';
+            } catch (e) {
+                showResult('❌ Error loading reference', 'error');
+                console.error(e);
+                sendToMaui('error', { message: e.message });
+                return e.message;
+            }
+        };
+
+        // Enable detect-only mode (no vector matching, just face detection + blink + capture)
+        window.registerExternalImageNoVector = function () {
+            detectOnlyMode = true;
+            facesDb = {}; // Clear any existing references
+            showResult('📸 Detect-Only Mode: Close eyes to capture', 'info');
+            document.getElementById('status').innerText = '✅ Ready! (Detect-Only Mode)';
+            return 'Detect-only mode enabled';
+        };
+
+        // Compute vector from base64 image and enable matching (used when no pre-computed vector exists)
+        window.registerExternalImageFromBase64 = async function (base64Data, name) {
+            try {
+                document.getElementById('status').innerText = '⏳ Computing face vector from image...';
+                showResult('⏳ Processing reference image...', 'info');
+
+                // Ensure proper data URI prefix
+                if (!base64Data.startsWith('data:image')) {
+                    base64Data = 'data:image/jpeg;base64,' + base64Data;
+                }
+
+                const img = new Image();
+                img.src = base64Data;
+
+                await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                });
+
+                // Use TinyFaceDetector (already loaded) to detect face and compute descriptor
+                const det = await faceapi.detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
+                    .withFaceLandmarks()
+                    .withFaceDescriptor();
+
+                if (!det) {
+                    // No face found in image - fall back to detect-only mode
+                    detectOnlyMode = true;
+                    facesDb = {};
+                    showResult('📸 No face in reference - Detect-Only Mode', 'info');
+                    document.getElementById('status').innerText = '✅ Ready! (Detect-Only Mode)';
+                    // Notify C# that vector is not available
+                    sendToMaui('error', { message: 'No face found in reference image, using detect-only mode' });
+                    return 'No face found, detect-only mode enabled';
+                }
+
+                // Store computed vector for matching
+                detectOnlyMode = false;
+                facesDb = {};
+                facesDb[name] = Array.from(det.descriptor);
+                updateDbCount();
+
+                showResult('✅ Reference Vector Computed', 'success');
+                document.getElementById('status').innerText = '✅ Ready! (Computed Vector Mode)';
+                return 'Computed and registered vector for ' + name;
+            } catch (e) {
+                // On error, fall back to detect-only mode
+                detectOnlyMode = true;
+                facesDb = {};
+                showResult('📸 Error processing image - Detect-Only Mode', 'info');
+                document.getElementById('status').innerText = '✅ Ready! (Detect-Only Mode)';
+                console.error('registerExternalImageFromBase64 error:', e);
+                sendToMaui('error', { message: 'Error computing vector: ' + e.message });
+                return 'Error: ' + e.message;
+            }
+        };
+
+        init();
+    </script>
+</body>
+
+</html>
