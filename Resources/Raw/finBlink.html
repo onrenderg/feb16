@@ -269,6 +269,8 @@
             }
         }
 
+        const MIN_FACE_WIDTH = 100; // Minimum face box width in pixels — reject far-away faces
+
         async function detectLoop() {
             const video = document.getElementById('video');
 
@@ -278,17 +280,24 @@
                     .withFaceDescriptor();
 
                 if (detection) {
-                    const now = Date.now();
-                    const closed = detectEyesClosed(detection.landmarks, Array.from(detection.descriptor));
+                    const faceBox = detection.detection.box;
 
-                    if (closed) {
-                        document.getElementById('blinkCount').innerText = '😑 Eyes Closed!';
-                        if ((now - lastAttendanceTime) > COOLDOWN) {
-                            lastAttendanceTime = now;
-                            markAttendance(Array.from(detection.descriptor));
-                        }
+                    if (faceBox.width < MIN_FACE_WIDTH) {
+                        document.getElementById('blinkCount').innerText = '📏 Come closer';
+                        console.log('Face too far: box width=' + faceBox.width + 'px (min=' + MIN_FACE_WIDTH + ')');
                     } else {
-                        document.getElementById('blinkCount').innerText = '👀 Eyes Open';
+                        const now = Date.now();
+                        const closed = detectEyesClosed(detection.landmarks, Array.from(detection.descriptor));
+
+                        if (closed) {
+                            document.getElementById('blinkCount').innerText = '😑 Eyes Closed!';
+                            if ((now - lastAttendanceTime) > COOLDOWN) {
+                                lastAttendanceTime = now;
+                                markAttendance(Array.from(detection.descriptor));
+                            }
+                        } else {
+                            document.getElementById('blinkCount').innerText = '👀 Eyes Open';
+                        }
                     }
                 } else {
                     document.getElementById('blinkCount').innerText = '❓ No face';
